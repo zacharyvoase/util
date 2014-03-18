@@ -1,9 +1,9 @@
 package com.twitter.app
 
 import com.twitter.util._
-import scala.collection.mutable.{ArrayBuffer, HashMap}
-import scala.collection.immutable.TreeSet
 import java.net.InetSocketAddress
+import scala.collection.immutable.TreeSet
+import scala.collection.mutable
 
 /**
  * A typeclass providing evidence for parsing type `T`
@@ -207,99 +207,127 @@ class Flag[T: Flaggable] private[app](val name: String, val help: String, defaul
  * accessible to all, are defined by [[com.twitter.app.GlobalFlag]].
  */
 class Flags(argv0: String, includeGlobal: Boolean) {
+  private[this] trait State
+  private[this] case class Parsed(remaining: Array[String]) extends State {
+    def unusedArguments: Seq[String] =
+      remaining.toSeq.filterNot(_ == "--").filterNot(_ == null)
+
+    def params: Map[String, (String, Seq[Int])] = {
+      val result = mutable.Map[String, (String, Seq[Int])]()
+      var i = 0
+      val size = remaining.size
+      while (i < size) {
+        val a = remaining(i)
+        if (a == "--") {
+          i = size
+        }
+        else if (isParam(a)) {
+          val arr = a.tail split("=", 2)
+          if (arr.size == 2)
+            result += arr(0) -> ((arr(1), Seq(i)))
+          else {
+            if (i + 1 == size || remaining(i + 1) == null)
+              result += arr(0) -> ((null, Seq(i)))
+            else if (isParam(remaining(i + 1)))
+              result += arr(0) -> ((null, Seq(i)))
+            else {
+              result += arr(0) -> ((remaining(i + 1), Seq(i, i + 1)))
+              i += 1
+            }
+          }
+        }
+        i += 1
+      }
+      result.toMap
+    }
+  }
+  private[this] case object Ready extends State
+  private[this] case object Finished extends State
+
   def this(argv0: String) = this(argv0, false)
 
-  private[this] val flags = new HashMap[String, Flag[_]]
-  
+  private[this] val flags: mutable.Map[String, Flag[_]] = mutable.Map.empty
+
   @volatile private[this] var cmdUsage = ""
 
-  // Add a help flag by default
-  private[this] val helpFlag = this("help", false, "Show this help")
+  private[this] var state: State = Ready
 
-  def add(f: Flag[_]) = synchronized {
+  private[this] def satisfy(f: Flag[_]): Unit = synchronized {
     if (flags contains f.name)
       System.err.printf("Flag %s already defined!\n", f.name)
-    flags(f.name) = f
-  }
-
-  def reset() = synchronized {
-    flags foreach { case (_, f) => f.reset() }
-  }
-
-  private[this] def resolveGlobalFlag(f: String) =
-    if (includeGlobal) GlobalFlag.get(f) else None
-
-  private[this] def resolveFlag(f: String): Option[Flag[_]] =
-    synchronized { flags.get(f) orElse resolveGlobalFlag(f) }
-
-  private[this] def hasFlag(f: String) = resolveFlag(f).isDefined
-  private[this] def flag(f: String) = resolveFlag(f).get
-
-  def parse(
-    args: Array[String],
-    undefOk: Boolean = false
-  ): Seq[String] = synchronized {
-    reset()
-    val remaining = new ArrayBuffer[String]
-    var i = 0
-    while (i < args.size) {
-      val a = args(i)
-      i += 1
-      if (a == "--") {
-        remaining ++= args.slice(i, args.size)
-        i = args.size
-      } else if (a startsWith "-") {
-        a drop 1 split("=", 2) match {
-          // There seems to be a bug Scala's pattern matching
-          // optimizer that leaves `v' dangling in the last case if
-          // we make this a wildcard (Array(k, _@_*))
-          case Array(k) if !hasFlag(k) =>
-            if (undefOk)
-              remaining += a
-            else
-              throw FlagParseException(k, new FlagUndefinedException)
-
-          // Flag isn't defined
-          case Array(k, _) if !hasFlag(k) =>
-            if (undefOk)
-              remaining += a
-            else
-              throw FlagParseException(k, new FlagUndefinedException)
-
-          // Optional argument without a value
-          case Array(k) if flag(k).noArgumentOk =>
-            flags(k).parse()
-
-          // Mandatory argument without a value and with no more arguments.
-          case Array(k) if i == args.size =>
-            throw FlagParseException(k, new FlagValueRequiredException)
-
-          // Mandatory argument with another argument
-          case Array(k) =>
-            i += 1
-            try flag(k).parse(args(i-1)) catch {
-              case NonFatal(e) => throw FlagParseException(k, e)
-            }
-
-          // Mandatory k=v
-          case Array(k, v) =>
-            try flag(k).parse(v) catch {
-              case e: Throwable => throw FlagParseException(k, e)
-            }
+    state match {
+      case p@Parsed(remaining) =>
+        flags += f.name -> f
+        p.params.get(f.name).foreach { case (value, list) =>
+          handleFlag(f, value)
+          list.foreach(remaining(_) = null)
         }
-      } else {
-        remaining += a
+      case _ =>
+        throw new IllegalStateException("Flags can only be satisfied after parse and before finish")
+    }
+  }
+
+  private[this] def isParam(f: String): Boolean = (f != null) && (f startsWith "-")
+
+  private[this] def handleFlag(flag: Flag[_], value: String) {
+    //no argument supplied
+    if (value == null) {
+      // optional argument
+      if (flag.noArgumentOk)
+        flag.parse()
+      // mandatory argument
+      else
+        throw FlagParseException(flag.name, new FlagValueRequiredException)
+    }
+    else
+      flag.parse(value)
+  }
+
+  private[this] def parseGlobals(map: Map[String, (String, Seq[Int])]): Seq[Int] = {
+    (for ((key, (value, indices)) <- map if GlobalFlag.get(key).isDefined) yield {
+      handleFlag(GlobalFlag.get(key).get, value)
+      indices
+    }).toSeq.flatten
+  }
+
+  /**
+   * Parses arguments for GlobalFlags, and stashes the remaining parameters
+   * for later use by local Flags.
+   */
+  def parse(args: Array[String]) {
+    synchronized {
+      state match {
+        case Ready =>
+          val remaining = args.clone()
+          val p = Parsed(remaining)
+          if (includeGlobal)
+            parseGlobals(p.params).foreach(remaining(_) = null)
+          state = p
+        case Parsed(_) =>
+          throw new IllegalStateException("You cannot call Flags#parse twice")
+        case Finished =>
+          throw new IllegalStateException("You cannot call Flags#parse after Flags#finish")
       }
     }
-
-    if (helpFlag())
-      throw FlagUsageError(usage)
-
-    remaining
   }
 
-  def parseOrExit1(args: Array[String], undefOk: Boolean = true): Seq[String] =
-    try parse(args, undefOk) catch {
+  /**
+   * Declares that no more flags will be added.
+   */
+  def finish(): Seq[String] = synchronized {
+    state match {
+      case p@Parsed(remaining) =>
+        state = Finished
+        p.unusedArguments
+      case Ready =>
+        throw new IllegalStateException("You cannot call Flags#finish before parsing")
+      case Finished =>
+        throw new IllegalStateException("You cannot call Flags#finish twice")
+    }
+  }
+
+  def parseOrExit1(args: Array[String]): Unit =
+    try parse(args) catch {
       case FlagUsageError(usage) =>
         System.err.println(usage)
         System.exit(1)
@@ -318,13 +346,13 @@ class Flags(argv0: String, includeGlobal: Boolean) {
 
   def apply[T: Flaggable](name: String, default: => T, help: String) = {
     val f = new Flag[T](name, help, default)
-    add(f)
+    satisfy(f)
     f
   }
 
   def apply[T](name: String, help: String)(implicit _f: Flaggable[T], m: Manifest[T]) = {
     val f = new Flag[T](name, help, m.toString)
-    add(f)
+    satisfy(f)
     f
   }
   
@@ -349,6 +377,10 @@ class Flags(argv0: String, includeGlobal: Boolean) {
     cmd+argv0+"\n"+(lines mkString "\n")+(
       if (globalLines.isEmpty) "" else "\nglobal flags:\n"+(globalLines mkString "\n")
     )
+  }
+
+  def throwUsage() {
+    throw FlagUsageError(usage)
   }
 
   /**
@@ -436,6 +468,8 @@ class Flags(argv0: String, includeGlobal: Boolean) {
 class GlobalFlag[T] private[app](defaultOrUsage: Either[() => T, String], help: String)(implicit _f: Flaggable[T])
     extends Flag[T](null, help, defaultOrUsage) {
 
+  private[this] var accessed = false
+
   def this(default: T, help: String)(implicit _f: Flaggable[T]) = this(Left(() => default), help)
   def this(help: String)(implicit _f: Flaggable[T], m: Manifest[T]) = this(Right(m.toString), help)
 
@@ -443,19 +477,29 @@ class GlobalFlag[T] private[app](defaultOrUsage: Either[() => T, String], help: 
   // doesn't give the right answer.
   override val name = getClass.getName.stripSuffix("$")
 
-  protected override def getValue = super.getValue orElse {
-    Option(System.getProperty(name)) flatMap { p =>
-      try Some(flaggable.parse(p)) catch {
-        case NonFatal(exc) =>
-          java.util.logging.Logger.getLogger("").log(
-            java.util.logging.Level.SEVERE,
-            "Failed to parse system property "+name+" as flag", exc)
-          None
+  protected override def getValue = synchronized {
+    accessed = true
+    super.getValue orElse {
+      Option(System.getProperty(name)) flatMap { p =>
+        try Some(flaggable.parse(p)) catch {
+          case NonFatal(exc) =>
+            java.util.logging.Logger.getLogger("").log(
+              java.util.logging.Level.SEVERE,
+              "Failed to parse system property "+name+" as flag", exc)
+            None
+        }
       }
     }
   }
 
   def getGlobalFlag: Flag[_] = this
+
+  override def parse(arg: String): Unit = synchronized {
+    if (accessed)
+      throw new IllegalStateException("You cannot parse a global flag after accessing its value")
+
+    super.parse(arg)
+  }
 }
 
 private object GlobalFlag {
@@ -471,7 +515,7 @@ private object GlobalFlag {
 
   def getAll(loader: ClassLoader) = {
     val markerClass = classOf[GlobalFlagVisible]
-    val flags = new ArrayBuffer[Flag[_]]
+    val flags = new mutable.ArrayBuffer[Flag[_]]
 
     for (info <- ClassPath.browse(loader)) try {
       val cls = info.load()

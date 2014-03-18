@@ -14,13 +14,9 @@ class NumProcsTest extends FunSpec {
     }
 
     it("should be settable as a flag") {
-      val old = numProcs()
       numProcs.parse("10.0")
 
       assert(numProcs() === 10.0)
-
-      numProcs.parse()
-      assert(numProcs() === old)
     }
   }
 }

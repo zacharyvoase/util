@@ -18,4 +18,54 @@ class AppTest extends FunSuite {
       throwApp.main(Array.empty[String])
     }
   }
+
+  test("App: flags should be parsed") {
+    val a = new App {
+      val f = flag("test", 3, "whatever")
+      def main() {
+        assert(f() === 4)
+      }
+    }
+    a.main(Array("-test=4"))
+  }
+
+  test("App: flags should be parsed in the constructor") {
+    val a = new App {
+      val f = flag("test", 3, "whatever")
+      assert(f() === 4)
+      def main() {}
+    }
+    a.main(Array("-test=4"))
+  }
+
+  test("App: should get you help correctly") {
+    val a = new App {
+      val f = flag("test", 3, "whatever")
+      def main() {}
+    }
+    val e = intercept[FlagUsageError] { a.main(Array("-help")) }
+    assert(e.usage.contains("-test='3': whatever"))
+  }
+
+  test("App: should work without specifying any flags") {
+    val a = new App {
+      def main() {}
+    }
+    a.main()
+  }
+
+  test("Every constructor is respected") {
+    abstract class Foo extends App {
+      var x: List[Int] = Nil
+      x ::= 0
+    }
+
+    class Bar extends Foo {
+      x ::= 1
+    }
+
+    val bar = new Bar()
+    bar.main(Array())
+    assert(bar.x === List(1, 0))
+  }
 }
