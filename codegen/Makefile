@@ -7,4 +7,7 @@ usage:
 ../util-test/src/main/scala/com/twitter/util/testing/ArgumentCapture.scala: util-test/ArgumentCapture.scala.mako
 	mako-render util-test/ArgumentCapture.scala.mako > $@
 
+../util-test/src/main/scala/com/twitter/util/testing/FunctionAnswers.scala: util-test/FunctionAnswers.scala.mako
+	mako-render util-test/FunctionAnswers.scala.mako > $@
+
 .PHONY: usage
